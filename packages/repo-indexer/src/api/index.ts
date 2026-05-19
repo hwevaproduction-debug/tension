@@ -8,12 +8,15 @@ import {
   writeFile,
 } from 'node:fs/promises'
 import path from 'node:path'
+import { performance } from 'node:perf_hooks'
 
 import { Queue } from 'bullmq'
+import { Hono } from 'hono'
 import IORedis from 'ioredis'
 import { z } from 'zod'
 
-import type { IndexingRequest } from '../types'
+import { defaultRetrievalBudget, retrieveIndexedChunks } from '../retrieval'
+import type { IndexingRequest, RepoIndexStore, RetrievalBudget } from '../types'
 
 export const IndexingRequestSchema = z.object({
   projectId: z.string().min(1),
@@ -30,6 +33,22 @@ export const IndexingRequestSchema = z.object({
   overlapTokens: z.number().int().min(0).max(5_000).optional(),
   force: z.boolean().optional(),
 })
+
+const RetrievalBudgetSchema = z.object({
+  maxChunks: z.number().int().min(1),
+  maxTokens: z.number().int().min(1),
+})
+
+export const RetrievalRequestSchema = z.object({
+  projectId: z.string().min(1),
+  query: z.string().min(1),
+  maxChunks: z.number().int().min(1).optional(),
+  maxTokens: z.number().int().min(1).optional(),
+  budget: RetrievalBudgetSchema.optional(),
+  dependencyExpansion: z.number().int().min(0).max(10).optional(),
+})
+
+type RetrievalRequest = z.infer<typeof RetrievalRequestSchema>
 
 export type IndexingJobStatus = 'queued' | 'processing' | 'completed' | 'failed'
 
@@ -52,6 +71,131 @@ export interface IndexingJobReceipt {
 
 export interface IndexingJobQueue {
   enqueue(request: IndexingRequest): Promise<IndexingJobReceipt>
+}
+
+export interface CreateIndexerHonoAppOptions {
+  queue?: IndexingJobQueue
+}
+
+type StoreWithStatusCounts = RepoIndexStore & {
+  getIndexStatusCounts?: (projectId: string) => Promise<Record<string, number>>
+}
+
+export function createIndexerHonoApp(
+  store: RepoIndexStore,
+  options: CreateIndexerHonoAppOptions = {},
+): Hono {
+  const app = new Hono()
+  const queue = options.queue ?? new FileIndexingQueue()
+
+  app.get('/health', (context) => context.json({ ok: true }))
+
+  app.post('/repo-indexes', async (context) => {
+    const body = await context.req.json().catch(() => undefined)
+    const parsed = IndexingRequestSchema.safeParse(body)
+
+    if (!parsed.success) {
+      return context.json({ error: 'invalid_request', issues: parsed.error.issues }, 400)
+    }
+
+    const receipt = await submitIndexingRequest(parsed.data, queue)
+    return context.json(receipt, 202)
+  })
+
+  app.post('/retrieve', async (context) => {
+    const body = await context.req.json().catch(() => undefined)
+    const parsed = RetrievalRequestSchema.safeParse(body)
+
+    if (!parsed.success) {
+      return context.json({ error: 'invalid_request', issues: parsed.error.issues }, 400)
+    }
+
+    const queryStartedAt = performance.now()
+    const result = await retrieveIndexedChunks(
+      store,
+      normalizeRetrievalRequest(parsed.data),
+    )
+    const elapsedMs = Math.round(performance.now() - queryStartedAt)
+
+    return context.json({
+      chunks: result.chunks,
+      totalTokens: result.tokenCount,
+      queryEmbeddingMs: elapsedMs,
+      searchMs: 0,
+    })
+  })
+
+  app.get('/symbols/:projectId', async (context) =>
+    context.json(await store.listSymbols(context.req.param('projectId'))),
+  )
+
+  app.get('/graph/:projectId', async (context) => {
+    const edges = await store.listDependencyEdges(context.req.param('projectId'))
+    const nodes = new Set<string>()
+    const graphEdges = edges.flatMap((edge) => {
+      nodes.add(edge.sourceFilePath)
+
+      const to = edge.resolvedFilePath || edge.importSpecifier
+
+      if (!to) {
+        return []
+      }
+
+      nodes.add(to)
+
+      return [
+        {
+          from: edge.sourceFilePath,
+          to,
+          importedNames: edge.importedNames ?? [],
+        },
+      ]
+    })
+
+    return context.json({
+      nodes: [...nodes].sort(),
+      edges: graphEdges,
+    })
+  })
+
+  app.get('/index/:projectId/status', async (context) => {
+    const statusCounts = (store as StoreWithStatusCounts).getIndexStatusCounts
+
+    if (!statusCounts) {
+      return context.json({ status: 'unknown' })
+    }
+
+    return context.json({
+      statuses: await statusCounts(context.req.param('projectId')),
+    })
+  })
+
+  return app
+}
+
+function normalizeRetrievalRequest(input: RetrievalRequest): {
+  projectId: string
+  query: string
+  budget?: RetrievalBudget
+  dependencyExpansion?: number
+} {
+  const hasTopLevelBudget =
+    input.maxChunks !== undefined || input.maxTokens !== undefined
+  const budget = hasTopLevelBudget
+    ? {
+        maxChunks:
+          input.maxChunks ?? input.budget?.maxChunks ?? defaultRetrievalBudget.maxChunks,
+        maxTokens:
+          input.maxTokens ?? input.budget?.maxTokens ?? defaultRetrievalBudget.maxTokens,
+      }
+    : input.budget
+
+  return {
+    projectId: input.projectId,
+    query: input.query,
+    budget,
+    dependencyExpansion: input.dependencyExpansion,
+  }
 }
 
 export class BullMQIndexingQueue implements IndexingJobQueue {

@@ -7,7 +7,38 @@ import type { EmbeddedRepoChunk, RepoChunk } from '../types'
 export const embeddingDimensions = 1536
 export const defaultEmbeddingModel = 'text-embedding-3-small'
 
-const embeddingCache = new Map<string, number[]>()
+class LruCache<K, V> {
+  private readonly entries = new Map<K, V>()
+
+  constructor(private readonly maxSize = 2_000) {}
+
+  get(key: K): V | undefined {
+    const value = this.entries.get(key)
+
+    if (value !== undefined) {
+      this.entries.delete(key)
+      this.entries.set(key, value)
+    }
+
+    return value
+  }
+
+  set(key: K, value: V): void {
+    if (this.entries.has(key)) {
+      this.entries.delete(key)
+    } else if (this.entries.size >= this.maxSize) {
+      const oldestKey = this.entries.keys().next().value
+
+      if (oldestKey !== undefined) {
+        this.entries.delete(oldestKey)
+      }
+    }
+
+    this.entries.set(key, value)
+  }
+}
+
+const embeddingCache = new LruCache<string, number[]>()
 
 export interface EmbeddingProvider {
   readonly model: string

@@ -138,6 +138,11 @@ export interface RepoIndexStore {
     embedding: number[],
     limit: number,
   ): Promise<RetrievalCandidate[]>
+  persistSummary?(
+    fileId: string,
+    summary: string,
+    model: string,
+  ): Promise<void>
 }
 
 export interface IndexedFileResult {

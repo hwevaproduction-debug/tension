@@ -6,12 +6,20 @@ import {
 } from 'node:http'
 import { pathToFileURL } from 'node:url'
 
-import { FileIndexingQueue, submitIndexingRequest } from '@traycer/repo-indexer'
+import {
+  createDrizzleRepoIndexStore,
+  createIndexerHonoApp,
+  createRepoIndexerDatabase,
+  FileIndexingQueue,
+  InMemoryRepoIndexStore,
+  type RepoIndexStore,
+} from '@traycer/repo-indexer'
 
 export interface ApiRuntimeOptions {
   port?: number
   host?: string
   queue?: FileIndexingQueue
+  store?: RepoIndexStore
 }
 
 export interface ApiRuntime {
@@ -26,8 +34,19 @@ export function createApiRuntime(options: ApiRuntimeOptions = {}): ApiRuntime {
   const port =
     options.port ?? Number.parseInt(process.env.API_PORT ?? '3001', 10)
   const queue = options.queue ?? new FileIndexingQueue()
+  const databaseRuntime = options.store
+    ? undefined
+    : process.env.DATABASE_URL
+      ? createRepoIndexerDatabase()
+      : undefined
+  const store =
+    options.store ??
+    (databaseRuntime
+      ? createDrizzleRepoIndexStore(databaseRuntime.db)
+      : new InMemoryRepoIndexStore())
+  const app = createIndexerHonoApp(store, { queue })
   const server = createServer((request, response) => {
-    handleRequest(request, response, queue).catch((error) => {
+    handleRequest(request, response, app).catch((error) => {
       writeJson(response, 500, {
         error: error instanceof Error ? error.message : String(error),
       })
@@ -50,8 +69,9 @@ export function createApiRuntime(options: ApiRuntimeOptions = {}): ApiRuntime {
         })
       })
     },
-    close() {
-      return closeServer(server)
+    async close() {
+      await closeServer(server)
+      await databaseRuntime?.close()
     },
   }
 }
@@ -61,30 +81,40 @@ export const apiRuntime = createApiRuntime()
 async function handleRequest(
   request: IncomingMessage,
   response: ServerResponse,
-  queue: FileIndexingQueue,
+  app: ReturnType<typeof createIndexerHonoApp>,
 ): Promise<void> {
-  if (request.method === 'GET' && request.url === '/health') {
-    writeJson(response, 200, { ok: true })
-    return
+  const body = request.method === 'GET' || request.method === 'HEAD'
+    ? undefined
+    : await readBody(request)
+  const requestBody = body ? toArrayBuffer(body) : undefined
+  const honoResponse = await app.fetch(
+    new Request(`http://${request.headers.host ?? '127.0.0.1'}${request.url ?? '/'}`, {
+      method: request.method,
+      headers: requestHeaders(request),
+      body: requestBody,
+    }),
+  )
+
+  response.writeHead(
+    honoResponse.status,
+    Object.fromEntries(honoResponse.headers.entries()),
+  )
+
+  if (honoResponse.body) {
+    const reader = honoResponse.body.getReader()
+
+    while (true) {
+      const { done, value } = await reader.read()
+
+      if (done) {
+        break
+      }
+
+      response.write(Buffer.from(value))
+    }
   }
 
-  if (request.method === 'POST' && request.url === '/repo-indexes') {
-    const receipt = await submitIndexingRequest(await readJson(request), queue)
-    writeJson(response, 202, receipt)
-    return
-  }
-
-  writeJson(response, 404, { error: 'not_found' })
-}
-
-async function readJson(request: IncomingMessage): Promise<unknown> {
-  const chunks: Buffer[] = []
-
-  for await (const chunk of request) {
-    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))
-  }
-
-  return JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}')
+  response.end()
 }
 
 function writeJson(
@@ -107,6 +137,36 @@ function closeServer(server: Server): Promise<void> {
       resolve()
     })
   })
+}
+
+async function readBody(request: IncomingMessage): Promise<Buffer> {
+  const chunks: Buffer[] = []
+
+  for await (const chunk of request) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))
+  }
+
+  return Buffer.concat(chunks)
+}
+
+function requestHeaders(request: IncomingMessage): Headers {
+  const headers = new Headers()
+
+  for (const [name, value] of Object.entries(request.headers)) {
+    if (Array.isArray(value)) {
+      value.forEach((item) => headers.append(name, item))
+    } else if (value !== undefined) {
+      headers.set(name, value)
+    }
+  }
+
+  return headers
+}
+
+function toArrayBuffer(buffer: Buffer): ArrayBuffer {
+  const arrayBuffer = new ArrayBuffer(buffer.length)
+  new Uint8Array(arrayBuffer).set(buffer)
+  return arrayBuffer
 }
 
 if (

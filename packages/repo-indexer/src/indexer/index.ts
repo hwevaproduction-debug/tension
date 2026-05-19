@@ -8,7 +8,7 @@ import { createDeterministicEmbedding, createEmbeddingProvider, embedChunks } fr
 import { extractFileMetadata } from '../extractor'
 import { parseRepository } from '../parser'
 import { selectChunksWithinBudget } from '../retrieval'
-import { summarizeFile } from '../summarizer'
+import { deterministicSummaryModel, summarizeFile } from '../summarizer'
 import {
   repoIndexChunks,
   repoIndexFiles,
@@ -19,6 +19,7 @@ import {
 import type { RepoIndexerDbClient } from '../db'
 import type {
   EmbeddedRepoChunk,
+  FileSummary,
   FileIndexStatus,
   IndexedFileResult,
   IndexingRequest,
@@ -176,6 +177,11 @@ export class InMemoryRepoIndexStore implements RepoIndexStore {
   private readonly chunks = new Map<string, StoredRepoChunk[]>()
   private readonly symbols = new Map<string, StoredRepoSymbol[]>()
   private readonly imports = new Map<string, StoredDependencyEdge[]>()
+  private readonly summaries = new Map<string, { summary: string; model: string }>()
+  private readonly deterministicSummaries = new Map<
+    string,
+    { summary: string; model: string }
+  >()
 
   async getFileByPath(input: {
     projectId: string
@@ -246,6 +252,8 @@ export class InMemoryRepoIndexStore implements RepoIndexStore {
         importedNames: item.importedNames,
       })),
     )
+    this.deterministicSummaries.set(fileId, input.summary)
+    this.summaries.set(fileId, input.summary)
 
     return {
       fileId,
@@ -315,11 +323,34 @@ export class InMemoryRepoIndexStore implements RepoIndexStore {
       .sort((left, right) => right.score - left.score)
       .slice(0, limit)
   }
+
+  async persistSummary(
+    fileId: string,
+    summary: string,
+    model: string,
+  ): Promise<void> {
+    this.summaries.set(fileId, { summary, model })
+  }
+
+  async getSummaryContextForFile(fileId: string): Promise<FileSummaryContext | undefined> {
+    const file = [...this.files.values()].find((item) => item.id === fileId)
+
+    if (!file) {
+      return undefined
+    }
+
+    return {
+      filePath: file.filePath,
+      symbols: this.symbols.get(fileId) ?? [],
+      imports: this.imports.get(fileId) ?? [],
+      deterministicSummary: this.deterministicSummaries.get(fileId),
+    }
+  }
 }
 
 export function createDrizzleRepoIndexStore(
   db: RepoIndexerDbClient,
-): RepoIndexStore {
+): RepoIndexStore & RepoIndexStoreWithSummaryContext & RepoIndexStoreWithStatusCounts {
   return {
     async getFileByPath(input) {
       const rows = await db
@@ -340,11 +371,21 @@ export function createDrizzleRepoIndexStore(
 
     async persistIndexedFile(input) {
       const now = new Date()
-      const existing = await this.getFileByPath({
-        projectId: input.file.projectId,
-        repoPath: input.file.repoPath,
-        filePath: input.file.filePath,
-      })
+      const existingRows = await db
+        .select()
+        .from(repoIndexFiles)
+        .where(
+          and(
+            eq(repoIndexFiles.projectId, input.file.projectId),
+            eq(repoIndexFiles.repoPath, input.file.repoPath),
+            eq(repoIndexFiles.filePath, input.file.filePath),
+          ),
+        )
+        .orderBy(desc(repoIndexFiles.updatedAt))
+        .limit(1)
+      const existing = existingRows[0]
+        ? toStoredIndexedFile(existingRows[0])
+        : undefined
       const fileId =
         existing?.id ??
         (
@@ -520,7 +561,123 @@ export function createDrizzleRepoIndexStore(
         score: 1 - Number(row.distance ?? 1),
       }))
     },
+
+    async persistSummary(fileId, summary, model) {
+      await db.insert(repoIndexSummaries).values({
+        fileId,
+        summary,
+        summaryEmbedding: createDeterministicEmbedding(summary),
+        model,
+      })
+    },
+
+    async getSummaryContextForFile(fileId) {
+      const files = await db
+        .select({
+          id: repoIndexFiles.id,
+          filePath: repoIndexFiles.filePath,
+          projectId: repoIndexFiles.projectId,
+        })
+        .from(repoIndexFiles)
+        .where(eq(repoIndexFiles.id, fileId))
+        .limit(1)
+      const file = files[0]
+
+      if (!file) {
+        return undefined
+      }
+
+      const [symbols, imports, deterministicSummaries] = await Promise.all([
+        db
+          .select({
+            id: repoIndexSymbols.id,
+            fileId: repoIndexSymbols.fileId,
+            filePath: repoIndexFiles.filePath,
+            name: repoIndexSymbols.name,
+            kind: repoIndexSymbols.kind,
+            isExported: repoIndexSymbols.isExported,
+            isDefaultExport: repoIndexSymbols.isDefaultExport,
+            chunkId: repoIndexSymbols.chunkId,
+          })
+          .from(repoIndexSymbols)
+          .innerJoin(repoIndexFiles, eq(repoIndexSymbols.fileId, repoIndexFiles.id))
+          .where(eq(repoIndexSymbols.fileId, fileId)),
+        db
+          .select({
+            sourceFileId: repoIndexImports.sourceFileId,
+            sourceFilePath: repoIndexFiles.filePath,
+            resolvedFileId: repoIndexImports.resolvedFileId,
+            resolvedFilePath: sql<string | null>`null`,
+            importSpecifier: repoIndexImports.importSpecifier,
+            isExternal: repoIndexImports.isExternal,
+            importedNames: repoIndexImports.importedNames,
+          })
+          .from(repoIndexImports)
+          .innerJoin(
+            repoIndexFiles,
+            eq(repoIndexImports.sourceFileId, repoIndexFiles.id),
+          )
+          .where(eq(repoIndexImports.sourceFileId, fileId)),
+        db
+          .select({
+            summary: repoIndexSummaries.summary,
+            model: repoIndexSummaries.model,
+          })
+          .from(repoIndexSummaries)
+          .where(
+            and(
+              eq(repoIndexSummaries.fileId, fileId),
+              eq(repoIndexSummaries.model, deterministicSummaryModel),
+            ),
+          )
+          .orderBy(desc(repoIndexSummaries.createdAt))
+          .limit(1),
+      ])
+      const deterministicSummary = deterministicSummaries[0]?.summary
+        ? {
+            summary: deterministicSummaries[0].summary,
+            model: deterministicSummaries[0].model ?? deterministicSummaryModel,
+          }
+        : undefined
+
+      return {
+        filePath: file.filePath,
+        symbols,
+        imports,
+        deterministicSummary,
+      }
+    },
+
+    async getIndexStatusCounts(projectId) {
+      const rows = await db
+        .select({
+          status: repoIndexFiles.status,
+          count: sql<number>`count(*)`,
+        })
+        .from(repoIndexFiles)
+        .where(eq(repoIndexFiles.projectId, projectId))
+        .groupBy(repoIndexFiles.status)
+
+      return Object.fromEntries(
+        rows.map((row) => [row.status, Number(row.count)]),
+      )
+    },
   }
+}
+
+export interface FileSummaryContext {
+  filePath: string
+  symbols: StoredRepoSymbol[]
+  imports: StoredDependencyEdge[]
+  deterministicSummary?: FileSummary
+}
+
+export interface RepoIndexStoreWithSummaryContext extends RepoIndexStore {
+  getSummaryContextForFile(fileId: string): Promise<FileSummaryContext | undefined>
+}
+
+export interface RepoIndexStoreWithStatusCounts extends RepoIndexStore {
+  getIndexStatusCounts(projectId: string): Promise<Record<string, number>>
 }
 
 async function replaceFileMetadata(

@@ -101,7 +101,7 @@ export async function discoverRepositoryFiles(
 ): Promise<string[]> {
   const root = path.resolve(repoPath)
   const discovered: string[] = []
-  const includeMatcher = ignore().add(options.includeGlobs ?? ['**/*'])
+  const includeGlobs = options.includeGlobs ?? []
   const excludeMatcher = ignore().add(options.excludeGlobs ?? [])
   const languageFilter = new Set(options.languages ?? [])
   const rootIgnore = ignore().add(await readGitignore(path.join(root, '.gitignore')))
@@ -157,7 +157,7 @@ export async function discoverRepositoryFiles(
 
       if (
         extensionLanguage.has(path.extname(relativePath).toLowerCase()) &&
-        includeMatcher.ignores(relativePath) &&
+        matchesIncludeGlobs(relativePath, includeGlobs) &&
         !excludeMatcher.ignores(relativePath)
       ) {
         discovered.push(absolutePath)
@@ -192,4 +192,48 @@ async function readGitignore(filePath: string): Promise<string[]> {
 function toRepoRelativePath(repoPath: string, absolutePath: string): string {
   const relativePath = path.relative(repoPath, absolutePath).replaceAll(path.sep, '/')
   return relativePath === '' ? '' : relativePath
+}
+
+function matchesIncludeGlobs(relativePath: string, includeGlobs: string[]): boolean {
+  if (includeGlobs.length === 0) {
+    return true
+  }
+
+  return includeGlobs.some((pattern) => globToRegExp(pattern).test(relativePath))
+}
+
+function globToRegExp(pattern: string): RegExp {
+  let source = '^'
+
+  for (let index = 0; index < pattern.length; index += 1) {
+    const character = pattern[index]
+    const next = pattern[index + 1]
+
+    if (character === '*') {
+      if (next === '*') {
+        const afterGlobstar = pattern[index + 2]
+        index += 1
+        source += afterGlobstar === '/' ? '(?:.*/)?' : '.*'
+        if (afterGlobstar === '/') {
+          index += 1
+        }
+      } else {
+        source += '[^/]*'
+      }
+      continue
+    }
+
+    if (character === '?') {
+      source += '[^/]'
+      continue
+    }
+
+    source += escapeRegExp(character)
+  }
+
+  return new RegExp(`${source}$`, 'u')
+}
+
+function escapeRegExp(input: string): string {
+  return input.replace(/[\\^$+?.()|[\]{}]/gu, '\\$&')
 }
